@@ -1,4 +1,4 @@
-﻿<# :
+<# :
 @echo off
 chcp 65001 >nul
 net session >nul 2>&1
@@ -26,7 +26,7 @@ $script:Lang = if ($userLocale -match '^zh') { 'ZH' } else { 'EN' }
 
 $I18N = @{
     ZH = @{
-        Title           = "Windows 磁盘深度清理、缓存迁移与全盘审计大师"
+        Title           = "Windows 磁盘清理大师 - 深度清理、缓存迁移与全盘审计"
         Status          = "当前 C 盘状态: 可用 {0} GB / 已用 {1} GB | 语言: 中文 (系统识别: $userLocale)"
         M1              = "1. [一键清理] 回收站 + 用户 %TEMP% + Windows 系统临时文件 (带进度)"
         M2              = "2. [开发瘦身] 扫描并清理 Gradle / Dart / Pub / npm 构建缓存 (带进度)"
@@ -125,7 +125,7 @@ $I18N = @{
         AudCancel       = "[*] 未选择任何条目，已安全返回。"
     }
     EN = @{
-        Title           = "Windows Disk Cleaner, Cache Migrator & Smart Auditor"
+        Title           = "Windows Disk Clean Master: Deep Clean, Cache Migration & Smart Audit"
         Status          = "C: Drive Status: Free {0} GB / Used {1} GB | Lang: English (System: $userLocale)"
         M1              = "1. [Quick Clean] Recycle Bin + %TEMP% + Windows Temp Files (with Progress)"
         M2              = "2. [Dev Slimming] Scan & Clean Gradle / Dart / Pub / npm Build Caches"
