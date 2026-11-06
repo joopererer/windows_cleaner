@@ -1,6 +1,6 @@
 ﻿#requires -Version 5.1
 <#
-Windows Disk Clean Master - Safe Edition V2.1
+Windows Disk Clean Master - Safe Edition V2.3
 Safety policy: read-only audit, no permanent deletion, never remove package stores wholesale,
 no global registry edits or process killing. Requires interactive Windows PowerShell 5.1+.
 #>
@@ -127,7 +127,7 @@ function ShowIntro {
     Clear-Host
     $line = '==========================================================================='
     Inform $line 'Cyan'
-    Inform (Say '       Windows 磁盘清理大师 V2.1 - 深度清理、缓存迁移与全盘审计' '       Windows Disk Clean Master V2.1 - Deep Clean, Cache Migration & Full-Disk Audit') 'Cyan'
+    Inform (Say '       Windows 磁盘清理大师 V2.3 - 深度清理、缓存迁移与全盘审计' '       Windows Disk Clean Master V2.3 - Deep Clean, Cache Migration & Full-Disk Audit') 'Cyan'
     try {
         $drive = Get-PSDrive -Name C -ErrorAction Stop
         $freeGB = [math]::Round($drive.Free / 1GB, 2)
@@ -135,7 +135,7 @@ function ShowIntro {
         Inform (Say ("       当前 C 盘状态: 可用 {0:N2} GB / 已用 {1:N2} GB | 语言: 中文 (系统识别: {2})" -f $freeGB,$usedGB,$script:DetectedLocale) ("       C: Drive Status: Free {0:N2} GB / Used {1:N2} GB | Lang: English (System: {2})" -f $freeGB,$usedGB,$script:DetectedLocale)) 'Yellow'
     } catch {}
     Inform $line 'Cyan'
-    Inform (Say '1. [一键清理] 预览用户 %TEMP% 旧文件，确认后移入回收站' '1. [Quick Clean] Preview older %TEMP% files; recycle on confirmation')
+    Inform (Say '1. [一键清理] 逐文件扫描用户 %TEMP% 旧文件，确认后移入回收站' '1. [Quick Clean] Scan older %TEMP% files individually; preview and recycle')
     Inform (Say '2. [开发瘦身] 扫描 Gradle / Dart / Pub / npm 缓存与项目构建产物 (安全隔离)' '2. [Dev Slimming] Scan caches and project build outputs (safe quarantine)')
     Inform (Say '3. [无感迁移] 开发缓存与自定义目录安全迁移 (校验 + 备份)' '3. [Seamless Migrate] Safe migration with verification and backup')
     Inform (Say '4. [目录迁移] 查看默认 Program Files 安装注册表路径 (只读)' '4. [Install Paths] Inspect Program Files registry paths (read-only)')
@@ -150,58 +150,153 @@ function ShowIntro {
     Inform $line 'Cyan'
 }
 
-function Invoke-TempPreview {
-    $cutoff = (Get-Date).AddDays(-7)
-    $temp = Canonical $env:TEMP
-    if (-not (Test-Path -LiteralPath $temp -PathType Container)) { Inform 'TEMP does not exist'; return }
-    # Only the active user's temp. No Windows Update or system service manipulation.
-    if (HasLinkAncestor $temp) { Write-Warning "TEMP is linked: $temp"; return }
-    $eligible = New-Object 'System.Collections.Generic.List[object]'
-    $errors = 0
-    try {
-        $top = @(Get-ChildItem -LiteralPath $temp -Force -ErrorAction Stop)
-        foreach ($item in $top) {
-            if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { continue }
-            if ($item.LastWriteTime -ge $cutoff) { continue }
-            try {
-                if ($item.PSIsContainer) {
-                    $tree = GetTree $item.FullName
-                    $sum = [long]0; $recent = $false
-                    foreach ($f in $tree.Files) {
-                        $sum += $f.Length
-                        if ((Get-Item -LiteralPath $f.FullName -ErrorAction Stop).LastWriteTime -ge $cutoff) { $recent = $true }
-                    }
-                    if ($recent) { continue }
-                } else { $sum = [long]$item.Length }
-                $eligible.Add([pscustomobject]@{Path=$item.FullName;Bytes=$sum;Modified=$item.LastWriteTime})
-            } catch { $errors++; continue }
-        }
-    } catch { Write-Warning "TEMP scan failed: $($_.Exception.Message)"; return }
-    $sumBytes = [long]0; foreach ($e in $eligible) { $sumBytes += $e.Bytes }
-    Inform (Say ("候选 {0} 项，约 {1}；跳过出错项 {2}。" -f $eligible.Count,(BytesHuman $sumBytes),$errors) ("Candidates: {0}, {1}; errors skipped: {2}." -f $eligible.Count,(BytesHuman $sumBytes),$errors)) 'Yellow'
-    $eligible | Sort-Object Bytes -Descending | Select-Object -First 20 Path,@{N='MB';E={[math]::Round($_.Bytes/1MB,1)}},Modified | Format-Table -AutoSize -Wrap
-    if ($eligible.Count -eq 0) { return }
-    if (-not (AskExact (Say '仅将这些临时项移入回收站，不会永久删除。输入 RECYCLE 确认' 'Move candidates to Recycle Bin (not permanent). Type RECYCLE') 'RECYCLE')) { return }
-    Add-Type -AssemblyName Microsoft.VisualBasic
-    $ok = 0; $failed = 0
-    foreach ($e in $eligible) {
+# Menu 1 in V2.3: conservative file-level scanning of the current user's TEMP.
+# Do not treat an entire directory as garbage based on its age.
+function Test-TempProtectedFile([string]$path) {
+    $name = [IO.Path]::GetFileName($path)
+    $extension = [IO.Path]::GetExtension($name).ToLowerInvariant()
+    # Conservative exclusions: user-owned documents, executable/installable files,
+    # source/config, archives and database/data stores are never auto-candidates.
+    $excluded = @('.exe','.dll','.sys','.msi','.msp','.msix','.appx','.bat','.cmd','.ps1','.psm1','.vbs','.js','.ts','.py','.rs','.java','.kt','.dart','.cs','.cpp','.c','.h','.hpp',
+        '.json','.yaml','.yml','.toml','.xml','.ini','.cfg','.config','.env','.lock','.db','.sqlite','.sqlite3','.mdb','.accdb','.bak',
+        '.zip','.7z','.rar','.tar','.gz','.tgz','.iso','.vhd','.vhdx','.vmdk','.qcow2','.pdf','.doc','.docx','.xls','.xlsx','.ppt','.pptx',
+        '.txt','.md','.csv','.rtf','.jpg','.jpeg','.png','.gif','.webp','.svg','.mp3','.mp4','.mov','.avi','.wav','.flac')
+    if ($excluded -contains $extension) { return $true }
+    if ($name -match '^(?i:package-lock\.json|pnpm-lock\.yaml|yarn\.lock|pubspec\.lock|cargo\.lock|gradle\.properties|pom\.xml)$') { return $true }
+    return $false
+}
+function Test-TempProtectedDirectory([string]$path) {
+    # Ignore VCS, package stores, source or tool config subtrees even if nested in TEMP.
+    $name = [IO.Path]::GetFileName($path.TrimEnd('\'))
+    if ($name -match '^(?i:\.git|\.svn|\.hg|\.ssh|\.gnupg|node_modules|\.gradle|\.dart_tool|\.venv|venv|__pycache__|\.cargo|\.pub-cache|\.npm|\.pnpm-store|\.yarn|\.idea|\.vscode)$') { return $true }
+    foreach ($extra in @(ExtraProtected)) {
         try {
-            if (-not (Under $e.Path $temp) -or (HasLinkAncestor $e.Path)) { throw 'Path changed / linked' }
-            if ((Get-Item -LiteralPath $e.Path -Force -ErrorAction Stop).LastWriteTime -ge $cutoff) { throw 'Modified since scan' }
-            # Recheck tree before any directory recycle operation.
-            if (Test-Path -LiteralPath $e.Path -PathType Container) {
-                $tree = GetTree $e.Path
-                foreach ($f in $tree.Files) {
-                    if ((Get-Item -LiteralPath $f.FullName).LastWriteTime -ge $cutoff) { throw 'Recent file inside' }
-                }
-                [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteDirectory($e.Path, 'OnlyErrorDialogs', 'SendToRecycleBin')
-            } else {
-                [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteFile($e.Path, 'OnlyErrorDialogs', 'SendToRecycleBin')
-            }
-            Log 'RecycleTemp' $e.Path 'OK'; $ok++
-        } catch { Log 'RecycleTemp' $e.Path ("FAILED: $($_.Exception.Message)"); $failed++ }
+            # Treat a user-protected directory and its ancestors as off-limits.
+            if (Under $path $extra) { return $true }
+        } catch { return $true }
     }
-    Inform (Say ("移入回收站：成功 {0}，跳过/失败 {1}。" -f $ok,$failed) ("Recycled: $ok; skipped/failed: $failed")) 'Cyan'
+    return $false
+}
+function Invoke-TempPreview {
+    $temp = Canonical $env:TEMP
+    if (-not (Test-Path -LiteralPath $temp -PathType Container)) {
+        Inform (Say '当前 TEMP 路径不存在。' 'Current TEMP directory does not exist.') 'Yellow'; return
+    }
+    if ((IsRoot $temp) -or (HasLinkAncestor $temp) -or (Test-TempProtectedDirectory $temp)) {
+        Inform (Say 'TEMP 路径为根目录、链接或受保护位置，已停止。' 'TEMP is a root, link or protected path; aborted.') 'Yellow'; return
+    }
+    # Enforce explicit user scope: do not accidentally operate under Windows or shared system paths.
+    $currentUser = Canonical $env:USERPROFILE
+    if (-not (Under $temp $currentUser)) {
+        Inform (Say ("TEMP 不在当前用户目录内，拒绝清理：{0}" -f $temp) ("TEMP is outside current user's profile, refusing: {0}" -f $temp)) 'Yellow'; return
+    }
+    $daysText = Read-Host (Say '保留最近多少天的文件？[默认 7，可输入 14 或 30]' 'Keep files modified in the last N days? [default 7, or 14/30]')
+    $days = 7
+    if (-not [string]::IsNullOrWhiteSpace($daysText)) {
+        if ($daysText.Trim() -notin @('7','14','30')) {
+            Inform (Say '仅支持 7、14、30 天；已取消。' 'Only 7, 14 or 30 days are supported; cancelled.') 'Yellow'; return
+        }
+        $days = [int]$daysText.Trim()
+    }
+    $cutoffUtc = (Get-Date).ToUniversalTime().AddDays(-$days)
+    $candidates = New-Object 'System.Collections.Generic.List[object]'
+    $stack = New-Object 'System.Collections.Generic.Stack[string]'
+    $stack.Push($temp)
+    $scanDirs = 0; $scanFiles = 0; $recent = 0; $protected = 0; $links = 0; $errors = 0
+    $candidateBytes = [long]0; $recentBytes = [long]0; $maxDirs = 150000; $maxFiles = 1500000
+    Inform (Say ("正在按文件扫描：{0}（保留最近 {1} 天）" -f $temp,$days) ("Scanning individual files: {0} (retaining recent {1} days)" -f $temp,$days)) 'Cyan'
+    while ($stack.Count -gt 0) {
+        if ($scanDirs -ge $maxDirs -or $scanFiles -ge $maxFiles) { $errors++; break }
+        $dir = $stack.Pop()
+        if ((Test-TempProtectedDirectory $dir) -or (HasLinkAncestor $dir)) { $protected++; continue }
+        $scanDirs++
+        try { $children = @(Get-ChildItem -LiteralPath $dir -Force -ErrorAction Stop) }
+        catch { $errors++; continue }
+        foreach ($item in $children) {
+            if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { $links++; continue }
+            if ($item.PSIsContainer) {
+                if (Test-TempProtectedDirectory $item.FullName) { $protected++; continue }
+                $stack.Push($item.FullName)
+                continue
+            }
+            $scanFiles++
+            if ($scanFiles -ge $maxFiles) { break }
+            if (($item.Attributes -band [IO.FileAttributes]::System) -ne 0 -or
+                ($item.Attributes -band [IO.FileAttributes]::ReadOnly) -ne 0 -or
+                (Test-TempProtectedFile $item.FullName)) { $protected++; continue }
+            if ($item.LastWriteTimeUtc -ge $cutoffUtc) { $recent++; $recentBytes += [long]$item.Length; continue }
+            $relative = $item.FullName.Substring($temp.Length).TrimStart('\')
+            $first = ($relative -split '\\')[0]
+            $candidates.Add([pscustomobject]@{ Path=$item.FullName;Bytes=[long]$item.Length;ModifiedUtc=$item.LastWriteTimeUtc;Attributes=[int]$item.Attributes;Group=$first })
+            $candidateBytes += [long]$item.Length
+        }
+        if (($scanDirs % 150) -eq 0) {
+            Write-Progress -Activity (Say '扫描用户 TEMP（不修改文件）' 'Scanning user TEMP (read only)') -Status ("Dirs {0}, Files {1}, Candidates {2}" -f $scanDirs,$scanFiles,$candidates.Count) -PercentComplete -1
+        }
+    }
+    Write-Progress -Activity (Say '扫描用户 TEMP（不修改文件）' 'Scanning user TEMP (read only)') -Completed
+    Inform (Say ("扫描文件：{0}；扫描目录：{1}；最近 {2} 天保护：{3} 项；按类型保护/目录：{4} 项；链接跳过：{5}；读取错误或达上限：{6}" -f $scanFiles,$scanDirs,$days,$recent,$protected,$links,$errors) ("Files: {0}; directories: {1}; recent files: {3}; protected: {4}; links: {5}; scan errors/limits: {6}" -f $scanFiles,$scanDirs,$days,$recent,$protected,$links,$errors)) 'Gray'
+    Inform (Say ("可选旧文件：{0} 项，约 {1}；这些文件尚未被删除。" -f $candidates.Count,(BytesHuman $candidateBytes)) ("Older-file candidates: {0}, about {1}; nothing has been deleted." -f $candidates.Count,(BytesHuman $candidateBytes))) 'Yellow'
+    if ($candidates.Count -eq 0) {
+        Inform (Say '没有满足当前保留与保护规则的文件；可尝试 14/30 天以提高保护程度，而不是降低保护范围。' 'No eligible files for these rules; 14/30 days makes selection more conservative.') 'DarkGray'
+        return
+    }
+    Inform (Say '候选按 TEMP 顶层来源分组（仅展示前 12 组）：' 'Candidates grouped by top-level TEMP directory (top 12):') 'Cyan'
+    $groups = @($candidates | Group-Object Group | ForEach-Object {
+        $bytes = [long]0; foreach ($v in $_.Group) { $bytes += $v.Bytes }
+        [pscustomobject]@{Directory=$_.Name;Files=$_.Count;GB=[math]::Round($bytes/1GB,3)}
+    } | Sort-Object GB -Descending)
+    $groups | Select-Object -First 12 | Format-Table -AutoSize
+    Inform (Say '体积最大的候选文件（前 20 个）：' 'Largest individual candidates (top 20):') 'Cyan'
+    $candidates | Sort-Object Bytes -Descending | Select-Object -First 20 |
+        Select-Object @{N='MB';E={[math]::Round($_.Bytes/1MB,1)}},@{N='Modified';E={$_.ModifiedUtc.ToLocalTime().ToString('yyyy-MM-dd')}},Path |
+        Format-Table -AutoSize -Wrap
+    if ($errors -gt 0) {
+        Inform (Say '注意：部分目录读取失败或达到限制；其内容不在候选列表中。' 'Some directories could not be read or limits were reached; their files are excluded.') 'Yellow'
+    }
+    Inform (Say '回收站并非备份；当前程序仅对当前用户 TEMP 中符合条件的普通文件逐个执行移入回收站。' 'Recycle Bin is not a backup. Only eligible ordinary files in this user TEMP will be recycled.') 'Yellow'
+    if (-not (AskExact (Say ("确认将 {0} 个旧文件（约 {1}）移入回收站？" -f $candidates.Count,(BytesHuman $candidateBytes)) ("Recycle {0} old files (about {1})?" -f $candidates.Count,(BytesHuman $candidateBytes))) 'RECYCLE')) {
+        Inform (Say '已取消，未修改文件。' 'Cancelled. Nothing changed.') 'Gray'; return
+    }
+    Add-Type -AssemblyName Microsoft.VisualBasic
+    $ok = 0; $failed = 0; $changed = 0; $okBytes = [long]0
+    foreach ($candidate in $candidates) {
+        try {
+            $path = Canonical $candidate.Path
+            if ((-not (Under $path $temp)) -or (HasLinkAncestor $path) -or (Test-TempProtectedDirectory (Split-Path -Path $path -Parent)) -or (Test-TempProtectedFile $path)) {
+                throw 'Path was changed or became protected'
+            }
+            $live = Get-Item -LiteralPath $path -Force -ErrorAction Stop
+            if ($live.PSIsContainer -or (($live.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) -or
+                (($live.Attributes -band [IO.FileAttributes]::System) -ne 0) -or
+                (($live.Attributes -band [IO.FileAttributes]::ReadOnly) -ne 0) -or
+                $live.LastWriteTimeUtc -ge $cutoffUtc -or
+                $live.LastWriteTimeUtc -ne $candidate.ModifiedUtc -or
+                [long]$live.Length -ne $candidate.Bytes -or
+                [int]$live.Attributes -ne $candidate.Attributes) {
+                $changed++; continue
+            }
+            # Reject files currently held open by other programs when exclusive access is unavailable.
+            $stream = $null
+            try {
+                $stream = [IO.File]::Open($path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::None)
+            } finally { if ($stream) { $stream.Dispose() } }
+            [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteFile($path,
+                [Microsoft.VisualBasic.FileIO.UIOption]::OnlyErrorDialogs,
+                [Microsoft.VisualBasic.FileIO.RecycleOption]::SendToRecycleBin)
+            $ok++; $okBytes += $candidate.Bytes
+        } catch {
+            $failed++
+            Log 'RecycleTempFailed' $candidate.Path $_.Exception.Message
+        }
+        if ((($ok + $failed + $changed) % 100) -eq 0) {
+            Write-Progress -Activity (Say '逐文件移入回收站' 'Recycling selected files') -Status ("Done {0}/{1}, failed {2}, changed {3}" -f ($ok+$failed+$changed),$candidates.Count,$failed,$changed) -PercentComplete ([math]::Min(100,[int](100*($ok+$failed+$changed)/$candidates.Count)))
+        }
+    }
+    Write-Progress -Activity (Say '逐文件移入回收站' 'Recycling selected files') -Completed
+    Inform (Say ("移入回收站成功 {0} 项（约 {1}）；状态变化跳过 {2}；失败/占用 {3}。" -f $ok,(BytesHuman $okBytes),$changed,$failed) ("Recycled {0} files (about {1}); changed/skipped {2}; failed/in use {3}." -f $ok,(BytesHuman $okBytes),$changed,$failed)) 'Cyan'
+    Inform (Say '移入回收站后，磁盘可用空间通常不会立即增加；需要日后手动清空回收站才会真正释放。' 'Recycling normally does not immediately reclaim disk space; empty the Recycle Bin later only after review.') 'Yellow'
+    Log 'TempFileScan' $temp ("days={0};candidates={1};recycled={2};changed={3};failed={4};bytes={5}" -f $days,$candidates.Count,$ok,$changed,$failed,$okBytes)
 }
 # Inspect a real npm executable, not only the first line of npm's output.
 function Get-NpmExecutable {
@@ -210,15 +305,111 @@ function Get-NpmExecutable {
     # npm is often in a version-manager's active Node directory; do not guess inactive versions.
     return $null
 }
-function Get-NpmCachePath([string]$executable) {
-    if (-not $executable) { return $null }
+# Launch npm.cmd through cmd.exe (Windows batch files cannot be reliably started
+# using .NET UseShellExecute=false directly). Capture stdout, stderr and exit code.
+function Invoke-NpmConfigCache([string]$executable) {
+    if (-not $executable) { return [pscustomobject]@{Path=$null;Error='npm not found'} }
+    if ($executable -match '[&|<>"]') { return [pscustomobject]@{Path=$null;Error='unsafe executable path characters'} }
+    $process = $null
     try {
-        $output = @(& $executable config get cache 2>$null)
-        if ($LASTEXITCODE -ne 0) { return $null }
-        $last = @($output | ForEach-Object { "$_".Trim() } | Where-Object { $_ -and $_ -notmatch '^npm (warn|notice|error)' } | Select-Object -Last 1)
-        if ($last.Count -ne 1 -or -not [IO.Path]::IsPathRooted($last[0])) { return $null }
-        return Canonical $last[0]
-    } catch { return $null }
+        $psi = New-Object System.Diagnostics.ProcessStartInfo
+        $psi.FileName = Join-Path $env:SystemRoot 'System32\cmd.exe'
+        # cmd.exe /d disables AutoRun; /s /c handles quoted executable paths.
+        $psi.Arguments = '/d /s /c ""{0}" config get cache --loglevel=silent"' -f $executable
+        $psi.UseShellExecute = $false
+        $psi.CreateNoWindow = $true
+        $psi.RedirectStandardOutput = $true
+        $psi.RedirectStandardError = $true
+        $psi.StandardOutputEncoding = [Text.Encoding]::UTF8
+        $psi.StandardErrorEncoding = [Text.Encoding]::UTF8
+        $process = New-Object System.Diagnostics.Process
+        $process.StartInfo = $psi
+        if (-not $process.Start()) { throw 'process did not start' }
+        $outTask = $process.StandardOutput.ReadToEndAsync()
+        $errTask = $process.StandardError.ReadToEndAsync()
+        if (-not $process.WaitForExit(15000)) {
+            try { $process.Kill() } catch {}
+            return [pscustomobject]@{Path=$null;Error='npm config timeout (15 seconds)'}
+        }
+        $stdout = $outTask.GetAwaiter().GetResult().Trim()
+        $stderr = $errTask.GetAwaiter().GetResult().Trim()
+        if ($process.ExitCode -ne 0) {
+            $detail = if ($stderr) { $stderr } else { $stdout }
+            if ($detail.Length -gt 400) { $detail = $detail.Substring(0,400) }
+            return [pscustomobject]@{Path=$null;Error=("exit {0}: {1}" -f $process.ExitCode,$detail)}
+        }
+        $lines = @($stdout -split '[\r\n]+' | ForEach-Object { $_.Trim().Trim('"') } | Where-Object { $_ -and $_ -notmatch '^npm (warn|notice|error)' })
+        if ($lines.Count -ne 1 -or -not [IO.Path]::IsPathRooted($lines[0])) {
+            return [pscustomobject]@{Path=$null;Error=("unexpected npm output: " + ($stdout.Substring(0,[Math]::Min(300,$stdout.Length))))}
+        }
+        return [pscustomobject]@{Path=(Canonical $lines[0]);Error=$null}
+    } catch {
+        return [pscustomobject]@{Path=$null;Error=$_.Exception.Message}
+    } finally { if ($process) { $process.Dispose() } }
+}
+function Get-NpmCachePath([string]$executable) { return (Invoke-NpmConfigCache $executable).Path }
+
+# These names are intentionally conservative: Win32_Process cannot reliably
+# determine the working directory of a process started by an IDE or shell.
+function Get-ActiveBuildProcesses {
+    $names = @('cargo.exe','rustc.exe','rustup.exe','flutter.exe','dart.exe',
+        'gradle.exe','gradle.bat','gradlew.exe','gradlew.bat','java.exe','javaw.exe',
+        'mvn.exe','mvn.cmd','kotlinc.exe','cmake.exe','ninja.exe','msbuild.exe')
+    $processes = @(Get-CimInstance Win32_Process -ErrorAction Stop |
+        Where-Object { $names -contains $_.Name.ToLowerInvariant() } |
+        Select-Object ProcessId,Name,CommandLine)
+    return $processes
+}
+function Assert-NoActiveBuild([string]$project) {
+    # Stop if any potentially relevant build process exists, including a process
+    # whose working directory cannot be determined. Safety beats convenience.
+    $active = @(Get-ActiveBuildProcesses)
+    if ($active.Count -eq 0) { return }
+    $sample = @($active | Select-Object -First 6 | ForEach-Object { '{0}(PID {1})' -f $_.Name,$_.ProcessId }) -join ', '
+    throw (Say ("发现正在运行的构建相关进程，无法可靠判断所属项目；已阻止隔离：$sample。请关闭相关构建进程后重试。") ("Build-related processes are running; project affiliation is uncertain. Quarantine blocked: $sample. Close build processes and retry."))
+}
+function Get-ProjectActivity([string]$project, [object]$buildTree) {
+    # File modification is an activity *signal*, not access/last-used time.
+    $latestProject = [datetime]::MinValue
+    try {
+        foreach ($file in @(Get-ChildItem -LiteralPath $project -File -Force -ErrorAction Stop)) {
+            if ($file.LastWriteTime -gt $latestProject) { $latestProject = $file.LastWriteTime }
+        }
+        foreach ($name in @('src','lib','test','tests','android','ios','windows','web')) {
+            $folder = Join-Path $project $name
+            if (-not (Test-Path -LiteralPath $folder -PathType Container)) { continue }
+            $dir = Get-Item -LiteralPath $folder -Force -ErrorAction Stop
+            if ($dir.LastWriteTime -gt $latestProject) { $latestProject = $dir.LastWriteTime }
+        }
+    } catch { $latestProject = [datetime]::MinValue }
+    $latestBuild = [datetime]::MinValue
+    # GetTree returns full paths; prefer a limited sample for performance.
+    foreach ($f in @($buildTree.Files | Select-Object -First 100)) {
+        try {
+            $t=(Get-Item -LiteralPath $f.FullName -ErrorAction Stop).LastWriteTime
+            if ($t -gt $latestBuild) { $latestBuild=$t }
+        } catch { $latestBuild=[datetime]::MinValue; break }
+    }
+    return [pscustomobject]@{Project=$latestProject;Build=$latestBuild}
+}
+function Format-Activity([datetime]$t) {
+    if ($t -eq [datetime]::MinValue) { return (Say '未知' 'unknown') }
+    return ('{0:yyyy-MM-dd}' -f $t)
+}
+function Parse-Selection([string]$value, [int]$max) {
+    if ($value -notmatch '^\s*\d+(?:\s*-\s*\d+)?(?:\s*,\s*\d+(?:\s*-\s*\d+)?)*\s*$') { throw 'Selection must contain numbers, commas or ranges like 1-3' }
+    $selected = New-Object 'System.Collections.Generic.HashSet[int]'
+    foreach ($token in ($value -split ',')) {
+        $parts = $token.Trim() -split '\s*-\s*'
+        $first = 0; $last = 0
+        if (-not [int]::TryParse($parts[0],[ref]$first)) { throw 'Invalid number' }
+        $last = $first
+        if ($parts.Count -eq 2 -and -not [int]::TryParse($parts[1],[ref]$last)) { throw 'Invalid range' }
+        if ($first -lt 1 -or $last -gt $max -or $last -lt $first) { throw 'Selection out of range' }
+        if ($last - $first -gt 999) { throw 'Range too large' }
+        for ($v=$first; $v -le $last; $v++) { [void]$selected.Add($v) }
+    }
+    return @($selected | Sort-Object)
 }
 function Get-ProjectKind([string]$dir) {
     # Anchored markers prevent arbitrary folders named build/target from becoming candidates.
@@ -271,7 +462,9 @@ function Get-DevProjects([string]$scanRoot) {
                     $tree = GetTree $candidate
                     $bytes = [long]0
                     foreach ($f in $tree.Files) { $bytes += $f.Length }
-                    $found.Add([pscustomobject]@{Project=$dir;Kind=$kind;Path=$candidate;Bytes=$bytes;Files=$tree.Files.Count;Risk=$risk;Modified=(Get-Item -LiteralPath $candidate).LastWriteTime})
+                    $activity = Get-ProjectActivity $dir $tree
+                    $volume = [IO.Path]::GetPathRoot((Canonical $candidate)).TrimEnd('\')
+                    $found.Add([pscustomobject]@{Project=$dir;Kind=$kind;Path=$candidate;Volume=$volume;Bytes=$bytes;Files=$tree.Files.Count;Risk=$risk;Modified=(Get-Item -LiteralPath $candidate).LastWriteTime;ProjectActivity=$activity.Project;BuildActivity=$activity.Build})
                 } catch { $errors++; Inform (Say "无法完整检查，已跳过：$candidate" "Incomplete scan; skipped: $candidate") 'DarkYellow' }
             }
         }
@@ -300,6 +493,7 @@ function Move-DevToQuarantine([object]$candidate) {
     $kind = Get-ProjectKind $candidate.Project
     if ($kind -ne $candidate.Kind -or -not (Test-DevCandidate $path $candidate.Project $kind)) { throw 'Project or candidate classification changed' }
     [void](AssertSafePath $path 'build quarantine')
+    Assert-NoActiveBuild $candidate.Project
     $newTree = GetTree $path
     $newBytes = [long]0; foreach ($f in $newTree.Files) { $newBytes += $f.Length }
     if ($newBytes -ne $candidate.Bytes -or $newTree.Files.Count -ne $candidate.Files) { throw 'Content changed since scan; skipped' }
@@ -326,7 +520,8 @@ function Invoke-DevReport {
     $gradle = if ($env:GRADLE_USER_HOME) { $env:GRADLE_USER_HOME } else { Join-Path $env:USERPROFILE '.gradle' }
     $pub = if ($env:PUB_CACHE) { $env:PUB_CACHE } else { Join-Path $env:LOCALAPPDATA 'Pub\Cache' }
     $npmExe = Get-NpmExecutable
-    $npm = Get-NpmCachePath $npmExe
+    $npmResult = Invoke-NpmConfigCache $npmExe
+    $npm = $npmResult.Path
     Inform (Say '依赖缓存保护（不删除）' 'Dependency caches are protected (no deletion)') 'Cyan'
     $rows = @(
         [pscustomobject]@{Name='Gradle wrapper';Path=(Join-Path $gradle 'wrapper\dists')},
@@ -341,7 +536,7 @@ function Invoke-DevReport {
         catch { Write-Warning "Skipped unreadable cache: $($r.Path)" }
     }
     if (-not $npmExe) { Inform (Say 'npm：当前终端未找到 npm.cmd；检查 PATH、Node 版本管理器或重开终端。' 'npm.cmd not found in this session; check PATH/version manager.') 'Yellow' }
-    elseif (-not $npm) { Inform (Say "发现 npm：$npmExe，但缓存路径查询失败，不执行校验。" "Found npm: $npmExe; cache path query failed; no action.") 'Yellow' }
+    elseif (-not $npm) { Inform (Say "发现 npm：$npmExe；查询失败：$($npmResult.Error)。不会操作 npm 缓存。" "Found npm: $npmExe; config query failed: $($npmResult.Error). Cache untouched.") 'Yellow' }
     else {
         Inform "npm executable: $npmExe" 'Gray'
         if (AskExact (Say '可选运行 npm cache verify（会修改 npm 自身缓存索引），输入 VERIFY' 'Optional npm cache verify (modifies its cache index). Type VERIFY') 'VERIFY') {
@@ -362,21 +557,38 @@ function Invoke-DevReport {
     } catch { Write-Warning "Project scan rejected: $($_.Exception.Message)"; return }
     $script:LastProjectScan = $projects
     if ($projects.Count -eq 0) { Inform (Say '没有确认符合严格规则的构建目录；不会删除任何内容。' 'No qualifying build directories found; nothing changed.') 'Yellow'; return }
-    Inform (Say '以下均为中风险，默认不选；隔离可能导致构建需要重跑，且不能保证运行中的进程不受影响。' 'All are medium risk and unselected by default; running builds may be affected.') 'Yellow'
-    for ($i=0; $i -lt $projects.Count; $i++) {
-        $c=$projects[$i]
-        Inform ("[{0}] {1,-12} {2,10}  {3}" -f ($i+1),$c.Kind,(BytesHuman $c.Bytes),$c.Path) 'Yellow'
+    Inform (Say '构建产物均为中风险，默认不选。最近活动日期仅是文件变动线索，不等于最近使用时间。' 'Build outputs are medium risk and unselected. Dates show modification signals, NOT actual last-used times.') 'Yellow'
+    $groups = @($projects | Group-Object Volume | Sort-Object Name)
+    foreach ($g in $groups) {
+        $sum = [long]0; foreach ($item in $g.Group) { $sum += $item.Bytes }
+        Inform (Say ("磁盘 {0}：{1} 个候选，约 {2}；隔离不会立即释放空间。" -f $g.Name,$g.Count,(BytesHuman $sum)) ("Volume {0}: {1} candidates, {2}; quarantine does NOT reclaim space." -f $g.Name,$g.Count,(BytesHuman $sum))) 'Cyan'
+        for ($i=0; $i -lt $projects.Count; $i++) {
+            $c=$projects[$i]
+            if ($c.Volume -ne $g.Name) { continue }
+            Inform ("[{0}] {1,-12} {2,10}  {3}" -f ($i+1),$c.Kind,(BytesHuman $c.Bytes),$c.Path) 'Yellow'
+            Inform (Say ("     项目文件变动：{0} | 构建文件样本变动：{1}" -f (Format-Activity $c.ProjectActivity),(Format-Activity $c.BuildActivity)) ("     Project file changes: {0} | Build sample changes: {1}" -f (Format-Activity $c.ProjectActivity),(Format-Activity $c.BuildActivity))) 'DarkGray'
+        }
     }
-    Inform (Say '只移动明确的项目构建目录到同卷隔离区，不清空依赖。输入编号可选一项；回车取消。' 'Move ONE build folder to same-volume quarantine; never delete dependencies. Enter index or Enter to cancel.') 'Cyan'
-    $choice = (Read-Host (Say '选择编号' 'Select number')).Trim()
+    Inform (Say '支持输入 1,3,5 或 1-10（也可混合）；回车取消。每项都会单独确认。隔离只移动文件，不释放空间。' 'Enter 1,3,5 or 1-10 (or mixed); Enter cancels. Each item requires confirmation. Quarantine does not free space.') 'Cyan'
+    $choice = (Read-Host (Say '选择编号' 'Select numbers')).Trim()
     if (-not $choice) { return }
-    $number=0
-    if (-not [int]::TryParse($choice,[ref]$number) -or $number -lt 1 -or $number -gt $projects.Count) { Write-Warning 'Invalid index'; return }
-    $candidate=$projects[$number-1]
-    Inform (Say "项目：$($candidate.Project)`n待隔离：$($candidate.Path)`n预计空间：$(BytesHuman $candidate.Bytes)`n须关闭 IDE/构建任务。隔离是移动而非释放磁盘空间。" "Project: $($candidate.Project)`nQuarantine: $($candidate.Path)`nSize: $(BytesHuman $candidate.Bytes)`nClose builds/IDEs. Quarantining MOVES files; it does NOT free disk space.") 'Yellow'
-    if (-not (AskExact (Say '输入 QUARANTINE 确认隔离（可在菜单 8 恢复）' 'Type QUARANTINE to move (restore via menu 8)') 'QUARANTINE')) { return }
-    try { $destination = Move-DevToQuarantine $candidate; Inform (Say "已隔离到：$destination。原有空间不会释放，需另行安全处理隔离数据。" "Quarantined to $destination. Disk space has NOT been reclaimed.") 'Green' }
-    catch { Write-Warning "Quarantine aborted: $($_.Exception.Message)" }
+    try { $indices = @(Parse-Selection $choice $projects.Count) }
+    catch { Write-Warning $_.Exception.Message; return }
+    $moved=0; $skipped=0
+    foreach ($index in $indices) {
+        $candidate=$projects[$index-1]
+        Inform (Say ("[{0}] 项目：{1}`n待隔离：{2}`n大小：{3}`n项目文件变动：{4}；构建样本变动：{5}`n请关闭 IDE 和构建任务。" -f $index,$candidate.Project,$candidate.Path,(BytesHuman $candidate.Bytes),(Format-Activity $candidate.ProjectActivity),(Format-Activity $candidate.BuildActivity)) ("[{0}] Project: {1}`nQuarantine: {2}`nSize: {3}`nProject changes: {4}; build sample: {5}`nClose IDEs/builds." -f $index,$candidate.Project,$candidate.Path,(BytesHuman $candidate.Bytes),(Format-Activity $candidate.ProjectActivity),(Format-Activity $candidate.BuildActivity))) 'Yellow'
+        # Perform process check before asking, and recheck just before moving.
+        try { Assert-NoActiveBuild $candidate.Project }
+        catch { Write-Warning $_.Exception.Message; $skipped++; continue }
+        if (-not (AskExact (Say ("第 {0} 项：输入 QUARANTINE 确认隔离，其他输入跳过" -f $index) ("Item {0}: type QUARANTINE to move; anything else skips" -f $index)) 'QUARANTINE')) { $skipped++; continue }
+        try {
+            $destination = Move-DevToQuarantine $candidate
+            Inform (Say "已隔离：$destination；磁盘空间未释放。" "Quarantined: $destination; no disk space reclaimed.") 'Green'
+            $moved++
+        } catch { Write-Warning "Quarantine aborted: $($_.Exception.Message)"; $skipped++ }
+    }
+    Inform (Say ("操作结束：成功隔离 {0} 项，跳过/拒绝 {1} 项。通过菜单 8 恢复，菜单 9 在保留期后清理。" -f $moved,$skipped) ("Finished: {0} quarantined, {1} skipped/blocked. Restore via 8, purge after hold via 9." -f $moved,$skipped)) 'Cyan' 
 }
 function Invoke-RestoreBuild {
     if (-not (Test-Path -LiteralPath $script:QuarantineFile -PathType Leaf)) { Inform (Say '还没有隔离记录。' 'No quarantine records.') 'Yellow'; return }
