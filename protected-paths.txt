@@ -1,0 +1,4 @@
+# Add one absolute path per line to protect it from migration and audit traversal.
+# Example:
+# D:\Projects
+# E:\Backups
