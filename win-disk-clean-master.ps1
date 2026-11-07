@@ -1,6 +1,6 @@
 ﻿#requires -Version 5.1
 <#
-Windows Disk Clean Master - Safe Edition V2.3
+Windows Disk Clean Master - Safe Edition V2.4.1
 Safety policy: read-only audit, no permanent deletion, never remove package stores wholesale,
 no global registry edits or process killing. Requires interactive Windows PowerShell 5.1+.
 #>
@@ -87,7 +87,7 @@ function AssertSafePath([string]$path, [string]$purpose) {
     }
     return $p
 }
-function GetTree([string]$path) {
+function GetTree([string]$path, [bool]$showProgress = $false) {
     # Fail closed on access errors, and refuse junctions/symlinks anywhere in the tree.
     $root = Canonical $path
     if (HasLinkAncestor $root) { throw "Linked directory: $root" }
@@ -95,8 +95,18 @@ function GetTree([string]$path) {
     $stack.Push($root)
     $files = New-Object 'System.Collections.Generic.List[object]'
     $dirs = New-Object 'System.Collections.Generic.List[string]'
+    $progressClock = [System.Diagnostics.Stopwatch]::StartNew()
+    $progressLast = -1000L
     while ($stack.Count -gt 0) {
         $current = $stack.Pop()
+        # Progress is intentionally indeterminate: scanning has no known total file count.
+        if ($showProgress -and ($progressClock.ElapsedMilliseconds - $progressLast -ge 400)) {
+            $progressLast = $progressClock.ElapsedMilliseconds
+            $currentShort = if ($current.Length -gt 105) { '...' + $current.Substring($current.Length - 102) } else { $current }
+            Write-Progress -Id 2 -Activity (Say '正在统计构建产物' 'Inspecting build output') `
+                -Status ('Files {0:N0} | Directories {1:N0} | Queued {2:N0} | {3:N0}s' -f $files.Count,$dirs.Count,$stack.Count,[math]::Floor($progressClock.Elapsed.TotalSeconds)) `
+                -CurrentOperation $currentShort -PercentComplete -1
+        }
         $children = @(Get-ChildItem -LiteralPath $current -Force -ErrorAction Stop)
         foreach ($entry in $children) {
             if (($entry.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw "Linked entry: $($entry.FullName)" }
@@ -105,6 +115,7 @@ function GetTree([string]$path) {
             else { $files.Add([pscustomobject]@{Relative=$relative;Length=[long]$entry.Length;FullName=$entry.FullName}) }
         }
     }
+    if ($showProgress) { Write-Progress -Id 2 -Activity (Say '正在统计构建产物' 'Inspecting build output') -Completed }
     return [pscustomobject]@{ Files=$files.ToArray(); Directories=$dirs.ToArray() }
 }
 function BytesHuman([double]$n) { return ('{0:N2} GB' -f ($n / 1GB)) }
@@ -127,7 +138,7 @@ function ShowIntro {
     Clear-Host
     $line = '==========================================================================='
     Inform $line 'Cyan'
-    Inform (Say '       Windows 磁盘清理大师 V2.3 - 深度清理、缓存迁移与全盘审计' '       Windows Disk Clean Master V2.3 - Deep Clean, Cache Migration & Full-Disk Audit') 'Cyan'
+    Inform (Say '       Windows 磁盘清理大师 V2.4.1 - 深度清理、缓存迁移与全盘审计' '       Windows Disk Clean Master V2.4.1 - Deep Clean, Cache Migration & Full-Disk Audit') 'Cyan'
     try {
         $drive = Get-PSDrive -Name C -ErrorAction Stop
         $freeGB = [math]::Round($drive.Free / 1GB, 2)
@@ -298,23 +309,60 @@ function Invoke-TempPreview {
     Inform (Say '移入回收站后，磁盘可用空间通常不会立即增加；需要日后手动清空回收站才会真正释放。' 'Recycling normally does not immediately reclaim disk space; empty the Recycle Bin later only after review.') 'Yellow'
     Log 'TempFileScan' $temp ("days={0};candidates={1};recycled={2};changed={3};failed={4};bytes={5}" -f $days,$candidates.Count,$ok,$changed,$failed,$okBytes)
 }
-# Inspect a real npm executable, not only the first line of npm's output.
+# FNM initializes dynamic PATH in shell profiles; this tool uses -NoProfile.
+# Initialize fnm for THIS process only, never permanently add fnm_multishells to PATH.
+function Initialize-NodeEnvironment {
+    $node = Get-Command node.exe -ErrorAction SilentlyContinue
+    if ($node -and (Test-Path -LiteralPath $node.Source -PathType Leaf)) { return }
+    $fnm = Get-Command fnm.exe -ErrorAction SilentlyContinue
+    if (-not $fnm) { $fnm = Get-Command fnm -ErrorAction SilentlyContinue }
+    if (-not $fnm) { return }
+    try {
+        $init = (& $fnm.Source env --shell powershell 2>&1 | Out-String)
+        if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($init)) { throw 'fnm env failed' }
+        # Local trusted fnm emits PowerShell environment setup, scoped to this process.
+        Invoke-Expression $init
+        # fnm env may already expose a usable default Node in this shell.
+        # Do not call bare `fnm use`: without a version it expects a version file.
+        $node = Get-Command node.exe -ErrorAction SilentlyContinue
+        if ($node -and $node.Source -and (Test-Path -LiteralPath $node.Source -PathType Leaf)) { return }
+        # Explicit default alias; no installation and no permanent PATH changes.
+        $useOutput = (& $fnm.Source use default 2>&1 | Out-String).Trim()
+        $useExit = $LASTEXITCODE
+        if ($useExit -ne 0) {
+            $detail = if ($useOutput) { $useOutput } else { 'No default or project Node version is available' }
+            Inform (Say ("fnm 已初始化，但版本选择失败 (exit {0})：{1}" -f $useExit,$detail) ("fnm initialized but version selection failed (exit {0}): {1}" -f $useExit,$detail)) 'Yellow'
+            return
+        }
+        $node = Get-Command node.exe -ErrorAction SilentlyContinue
+        if (-not $node -or -not (Test-Path -LiteralPath $node.Source -PathType Leaf)) {
+            Inform (Say 'fnm 已选择版本，但当前进程仍找不到 node.exe。请检查 fnm default 和 PATH。' 'fnm selected a version but node.exe is still unavailable in this process; check fnm default and PATH.') 'Yellow'
+        }
+    } catch {
+        Inform (Say ("fnm 环境初始化失败：{0}" -f $_.Exception.Message) ("fnm initialization failed: {0}" -f $_.Exception.Message)) 'Yellow'
+    }
+}
 function Get-NpmExecutable {
+    Initialize-NodeEnvironment
+    $node = Get-Command node.exe -ErrorAction SilentlyContinue
+    if (-not $node -or -not $node.Source -or -not (Test-Path -LiteralPath $node.Source -PathType Leaf)) { return $null }
+    $nodeDir = Split-Path $node.Source -Parent
+    $paired = Join-Path $nodeDir 'npm.cmd'
+    if (Test-Path -LiteralPath $paired -PathType Leaf) { return $paired }
     $cmds = @(Get-Command npm.cmd -All -ErrorAction SilentlyContinue) + @(Get-Command npm.exe -All -ErrorAction SilentlyContinue)
-    foreach ($cmd in $cmds) { if ($cmd -and $cmd.Source -and (Test-Path -LiteralPath $cmd.Source -PathType Leaf)) { return $cmd.Source } }
-    # npm is often in a version-manager's active Node directory; do not guess inactive versions.
+    foreach ($cmd in $cmds) {
+        if ($cmd -and $cmd.Source -and (Test-Path -LiteralPath $cmd.Source -PathType Leaf)) { return $cmd.Source }
+    }
     return $null
 }
-# Launch npm.cmd through cmd.exe (Windows batch files cannot be reliably started
-# using .NET UseShellExecute=false directly). Capture stdout, stderr and exit code.
+# Run npm.cmd via cmd.exe, with a deadline and captured diagnostics.
 function Invoke-NpmConfigCache([string]$executable) {
-    if (-not $executable) { return [pscustomobject]@{Path=$null;Error='npm not found'} }
-    if ($executable -match '[&|<>"]') { return [pscustomobject]@{Path=$null;Error='unsafe executable path characters'} }
+    if (-not $executable) { return [pscustomobject]@{Path=$null;Error='npm/node pair not found in this session'} }
+    if ($executable -match '[&|<>"%!]') { return [pscustomobject]@{Path=$null;Error='unsafe executable path characters'} }
     $process = $null
     try {
         $psi = New-Object System.Diagnostics.ProcessStartInfo
         $psi.FileName = Join-Path $env:SystemRoot 'System32\cmd.exe'
-        # cmd.exe /d disables AutoRun; /s /c handles quoted executable paths.
         $psi.Arguments = '/d /s /c ""{0}" config get cache --loglevel=silent"' -f $executable
         $psi.UseShellExecute = $false
         $psi.CreateNoWindow = $true
@@ -340,33 +388,67 @@ function Invoke-NpmConfigCache([string]$executable) {
         }
         $lines = @($stdout -split '[\r\n]+' | ForEach-Object { $_.Trim().Trim('"') } | Where-Object { $_ -and $_ -notmatch '^npm (warn|notice|error)' })
         if ($lines.Count -ne 1 -or -not [IO.Path]::IsPathRooted($lines[0])) {
-            return [pscustomobject]@{Path=$null;Error=("unexpected npm output: " + ($stdout.Substring(0,[Math]::Min(300,$stdout.Length))))}
+            return [pscustomobject]@{Path=$null;Error='Unexpected npm cache path output'}
         }
-        return [pscustomobject]@{Path=(Canonical $lines[0]);Error=$null}
-    } catch {
-        return [pscustomobject]@{Path=$null;Error=$_.Exception.Message}
-    } finally { if ($process) { $process.Dispose() } }
+        return [pscustomobject]@{Path=$lines[0];Error=$null}
+    } catch { return [pscustomobject]@{Path=$null;Error=$_.Exception.Message} }
+    finally { if ($process) { $process.Dispose() } }
 }
 function Get-NpmCachePath([string]$executable) { return (Invoke-NpmConfigCache $executable).Path }
 
-# These names are intentionally conservative: Win32_Process cannot reliably
-# determine the working directory of a process started by an IDE or shell.
+# Project-specific process detection: global java/dart processes are not automatic blockers.
+# This is not a handle enumerator: unknown project affiliation still needs explicit consent.
 function Get-ActiveBuildProcesses {
     $names = @('cargo.exe','rustc.exe','rustup.exe','flutter.exe','dart.exe',
         'gradle.exe','gradle.bat','gradlew.exe','gradlew.bat','java.exe','javaw.exe',
         'mvn.exe','mvn.cmd','kotlinc.exe','cmake.exe','ninja.exe','msbuild.exe')
     $processes = @(Get-CimInstance Win32_Process -ErrorAction Stop |
         Where-Object { $names -contains $_.Name.ToLowerInvariant() } |
-        Select-Object ProcessId,Name,CommandLine)
+        Select-Object ProcessId,Name,CommandLine,ExecutablePath)
     return $processes
 }
-function Assert-NoActiveBuild([string]$project) {
-    # Stop if any potentially relevant build process exists, including a process
-    # whose working directory cannot be determined. Safety beats convenience.
+function Test-ProcessProjectReference([string]$command, [string]$project) {
+    if ([string]::IsNullOrWhiteSpace($command)) { return $false }
+    $p = (Canonical $project).TrimEnd('\')
+    # Only a full absolute path followed by boundary; prevent C:\src\foo matching C:\src\foobar.
+    $pattern = '(?i)' + [regex]::Escape($p) + '(?=$|[\\/"''\s;,:])'
+    return [regex]::IsMatch($command, $pattern)
+}
+function Get-ProjectProcessRisk([string]$project, [string]$buildPath) {
+    $p = Canonical $project
+    $build = Canonical $buildPath
     $active = @(Get-ActiveBuildProcesses)
-    if ($active.Count -eq 0) { return }
-    $sample = @($active | Select-Object -First 6 | ForEach-Object { '{0}(PID {1})' -f $_.Name,$_.ProcessId }) -join ', '
-    throw (Say ("发现正在运行的构建相关进程，无法可靠判断所属项目；已阻止隔离：$sample。请关闭相关构建进程后重试。") ("Build-related processes are running; project affiliation is uncertain. Quarantine blocked: $sample. Close build processes and retry."))
+    $related = @(); $uncertain = @(); $unrelated = @()
+    foreach ($proc in $active) {
+        $command = [string]$proc.CommandLine
+        $executable = [string]$proc.ExecutablePath
+        $bound = $false
+        if ($executable -and [IO.Path]::IsPathRooted($executable)) {
+            if (Under $executable $build) { $bound = $true }
+        }
+        if (-not $bound) { $bound = Test-ProcessProjectReference $command $p }
+        if ($bound) { $related += $proc; continue }
+        # Strong evidence for other projects is okay; ambiguous command lines remain uncertain.
+        # Another absolute workspace path cannot be safely inferred from a short basename.
+        if (-not [string]::IsNullOrWhiteSpace($command)) {
+            $otherProjectPath = [regex]::IsMatch($command, '(?i)[A-Z]:\\[^"\r\n]*?[\\/](?:build|target)[\\/ ]')
+            if ($otherProjectPath) { $unrelated += $proc; continue }
+        }
+        $uncertain += $proc
+    }
+    return [pscustomobject]@{Related=@($related);Uncertain=@($uncertain);Unrelated=@($unrelated)}
+}
+function Assert-NoActiveBuild([string]$project, [string]$buildPath, [bool]$allowUncertain = $false) {
+    $risk = Get-ProjectProcessRisk $project $buildPath
+    if ($risk.Related.Count -gt 0) {
+        $list = (@($risk.Related | Select-Object -First 6 | ForEach-Object { '{0}(PID {1})' -f $_.Name,$_.ProcessId }) -join ', ')
+        throw (Say "当前项目存在明确关联进程，已禁止隔离：$list" "Processes directly reference this project; quarantine blocked: $list")
+    }
+    if ($risk.Uncertain.Count -gt 0 -and -not $allowUncertain) {
+        $list = (@($risk.Uncertain | Select-Object -First 6 | ForEach-Object { '{0}(PID {1})' -f $_.Name,$_.ProcessId }) -join ', ')
+        throw (Say "进程归属不确定：$list。请额外确认后再尝试。" "Uncertain process affiliation: $list. Explicit acknowledgement required.")
+    }
+    return $risk
 }
 function Get-ProjectActivity([string]$project, [object]$buildTree) {
     # File modification is an activity *signal*, not access/last-used time.
@@ -443,10 +525,18 @@ function Get-DevProjects([string]$scanRoot) {
     $stack = New-Object 'System.Collections.Generic.Stack[string]'
     $stack.Push($scanRoot)
     $checked = 0; $errors = 0; $limit = 15000
+    $scanClock = [System.Diagnostics.Stopwatch]::StartNew()
+    $scanLast = -1000L
     $ignored = @('.git','.svn','node_modules','.gradle','.dart_tool','.idea','.vscode','.venv','venv','vendor','dist','build','target','.next','.nuxt','.wdcs-quarantine','WinDiskCleanSafe-Quarantine')
     while ($stack.Count -gt 0 -and $checked -lt $limit) {
         $dir = $stack.Pop(); $checked++
-        if ($checked % 250 -eq 0) { Write-Progress -Activity (Say '识别开发项目' 'Detecting developer projects') -Status "$checked directories" }
+        if (($checked % 40 -eq 0) -or ($scanClock.ElapsedMilliseconds - $scanLast -ge 600)) {
+            $scanLast = $scanClock.ElapsedMilliseconds
+            $currentShort = if ($dir.Length -gt 105) { '...' + $dir.Substring($dir.Length - 102) } else { $dir }
+            Write-Progress -Id 1 -Activity (Say '识别开发项目（只读扫描）' 'Detecting developer projects (read-only)') `
+                -Status ('Checked {0:N0} | Candidates {1:N0} | Queued {2:N0} | {3:N0}s' -f $checked,$found.Count,$stack.Count,[math]::Floor($scanClock.Elapsed.TotalSeconds)) `
+                -CurrentOperation $currentShort -PercentComplete -1
+        }
         try {
             if (AuditBlocked $dir) { continue }
             $entries = @(Get-ChildItem -LiteralPath $dir -Force -ErrorAction Stop)
@@ -459,7 +549,7 @@ function Get-DevProjects([string]$scanRoot) {
                 $risk = Test-DevCandidate $candidate $dir $kind
                 if (-not $risk) { continue }
                 try {
-                    $tree = GetTree $candidate
+                    $tree = GetTree $candidate $true
                     $bytes = [long]0
                     foreach ($f in $tree.Files) { $bytes += $f.Length }
                     $activity = Get-ProjectActivity $dir $tree
@@ -477,7 +567,8 @@ function Get-DevProjects([string]$scanRoot) {
             $stack.Push($e.FullName)
         }
     }
-    Write-Progress -Activity (Say '识别开发项目' 'Detecting developer projects') -Completed
+    Write-Progress -Id 2 -Activity (Say '正在统计构建产物' 'Inspecting build output') -Completed
+    Write-Progress -Id 1 -Activity (Say '识别开发项目（只读扫描）' 'Detecting developer projects (read-only)') -Completed
     if ($stack.Count -gt 0) { Write-Warning (Say '扫描达到 15000 个目录上限，结果并不完整。' '15,000-directory scan cap reached; results are incomplete.') }
     Inform (Say "检查目录：$checked；读取异常：$errors；已识别构建候选：$($found.Count)" "Directories: $checked; errors: $errors; build candidates: $($found.Count)") 'Gray'
     return @($found.ToArray())
@@ -487,13 +578,13 @@ function Save-QuarantineRecord([object]$entry) {
     if (-not (Test-Path -LiteralPath $parent)) { [void](New-Item -ItemType Directory -Path $parent -Force -ErrorAction Stop) }
     $entry | Export-Csv -LiteralPath $script:QuarantineFile -Append -Encoding UTF8 -NoTypeInformation -ErrorAction Stop
 }
-function Move-DevToQuarantine([object]$candidate) {
+function Move-DevToQuarantine([object]$candidate, [bool]$allowUncertain = $false) {
     # Recheck the source immediately before the move. Keep quarantine on the same volume.
     $path = Canonical $candidate.Path
     $kind = Get-ProjectKind $candidate.Project
     if ($kind -ne $candidate.Kind -or -not (Test-DevCandidate $path $candidate.Project $kind)) { throw 'Project or candidate classification changed' }
     [void](AssertSafePath $path 'build quarantine')
-    Assert-NoActiveBuild $candidate.Project
+    Assert-NoActiveBuild $candidate.Project $path $allowUncertain | Out-Null
     $newTree = GetTree $path
     $newBytes = [long]0; foreach ($f in $newTree.Files) { $newBytes += $f.Length }
     if ($newBytes -ne $candidate.Bytes -or $newTree.Files.Count -ne $candidate.Files) { throw 'Content changed since scan; skipped' }
@@ -535,15 +626,29 @@ function Invoke-DevReport {
         try { Inform ("{0,-18} {1,12} [PROTECTED]  {2}" -f $r.Name,(BytesHuman (GetTreeSize $r.Path)),$r.Path) 'Yellow' }
         catch { Write-Warning "Skipped unreadable cache: $($r.Path)" }
     }
-    if (-not $npmExe) { Inform (Say 'npm：当前终端未找到 npm.cmd；检查 PATH、Node 版本管理器或重开终端。' 'npm.cmd not found in this session; check PATH/version manager.') 'Yellow' }
+    if (-not $npmExe) { Inform (Say '未找到有效的 node.exe + npm.cmd 组合；如果使用 fnm，请配置默认版本：fnm default <版本>。' 'No working node.exe + npm.cmd pair; if using fnm, configure fnm default <version>.') 'Yellow' }
     elseif (-not $npm) { Inform (Say "发现 npm：$npmExe；查询失败：$($npmResult.Error)。不会操作 npm 缓存。" "Found npm: $npmExe; config query failed: $($npmResult.Error). Cache untouched.") 'Yellow' }
     else {
         Inform "npm executable: $npmExe" 'Gray'
-        if (AskExact (Say '可选运行 npm cache verify（会修改 npm 自身缓存索引），输入 VERIFY' 'Optional npm cache verify (modifies its cache index). Type VERIFY') 'VERIFY') {
+        Inform (Say '--- npm 缓存维护（仅维护 npm 缓存，不清理项目依赖）---' '--- npm cache maintenance (does not remove project dependencies) ---') 'Cyan'
+        Inform (Say '这是什么：npm 的官方缓存完整性校验，可回收部分无效缓存并修复缓存索引。' 'What it does: npm verifies cache integrity, reclaims some unused data and repairs its index.') 'Gray'
+        Inform (Say '不影响：项目中的 node_modules、package.json 和锁文件；不会清空整个缓存。' 'Not affected: project node_modules, package.json or lockfiles; does not wipe the whole cache.') 'Gray'
+        Inform (Say '注意：缓存索引可能改变、部分无效缓存可能被移除；以后重新安装依赖时可能需要联网。' 'Note: cache index may change and invalid data may be removed; a later install may need network access.') 'Yellow'
+        Inform (Say '可选操作：' 'Choose an action:') 'Cyan'
+        Inform (Say '  [1] 校验并维护缓存（推荐）：运行 npm cache verify；可能少量释放空间。' '  [1] Verify and maintain (recommended): run npm cache verify; may reclaim some space.') 'Green'
+        Inform (Say '  [2] 跳过（完全不修改 npm 缓存）：适合离线、私有依赖或暂不需要维护。' '  [2] Skip (leave npm cache unchanged): for offline/private dependencies or no maintenance.') 'Gray'
+        $npmChoice = (Read-Host (Say '请选择 [1/2，回车默认 1]' 'Select [1/2, Enter defaults to 1]')).Trim()
+        if ($npmChoice -eq '' -or $npmChoice -eq '1') {
+            Inform (Say '正在执行 npm cache verify；不会执行 npm cache clean --force。' 'Running npm cache verify; npm cache clean --force will NOT be run.') 'Cyan'
             & $npmExe cache verify
             $status = $LASTEXITCODE
             Log 'NpmVerify' $npm "exit=$status"
-            Inform "npm exit code: $status"
+            if ($status -eq 0) { Inform (Say 'npm 缓存校验完成。' 'npm cache verification completed.') 'Green' }
+            else { Inform (Say ("npm 缓存校验未成功完成，退出码：{0}。" -f $status) ("npm cache verification failed, exit code: {0}." -f $status)) 'Yellow' }
+        } elseif ($npmChoice -eq '2') {
+            Inform (Say '已跳过 npm 缓存维护，未作更改。' 'Skipped npm cache maintenance; no changes made.') 'Gray'
+        } else {
+            Inform (Say '无效选项：已安全跳过 npm 缓存维护。' 'Invalid choice: safely skipped npm cache maintenance.') 'Yellow'
         }
     }
     Inform (Say '输入开发项目的上级目录，例如 D:\\Projects；直接回车跳过。不会扫描整个 C 盘。' 'Enter a parent folder of projects, e.g. D:\\Projects; Enter to skip. No full C: scan.') 'Cyan'
@@ -569,24 +674,102 @@ function Invoke-DevReport {
             Inform (Say ("     项目文件变动：{0} | 构建文件样本变动：{1}" -f (Format-Activity $c.ProjectActivity),(Format-Activity $c.BuildActivity)) ("     Project file changes: {0} | Build sample changes: {1}" -f (Format-Activity $c.ProjectActivity),(Format-Activity $c.BuildActivity))) 'DarkGray'
         }
     }
-    Inform (Say '支持输入 1,3,5 或 1-10（也可混合）；回车取消。每项都会单独确认。隔离只移动文件，不释放空间。' 'Enter 1,3,5 or 1-10 (or mixed); Enter cancels. Each item requires confirmation. Quarantine does not free space.') 'Cyan'
+    Inform (Say '支持输入 1,3,5 或 1-10（也可混合）；回车取消。先预检，再选择逐项或批量确认。隔离不立即释放空间。' 'Enter 1,3,5 or 1-10 (or mixed); Enter cancels. Preflight before choosing individual or batch confirmation. Quarantine does not reclaim space.') 'Cyan'
     $choice = (Read-Host (Say '选择编号' 'Select numbers')).Trim()
     if (-not $choice) { return }
     try { $indices = @(Parse-Selection $choice $projects.Count) }
     catch { Write-Warning $_.Exception.Message; return }
-    $moved=0; $skipped=0
+
+    # Preflight is read-only: a process that clearly references this project is ALWAYS blocked.
+    # An unknown process alone is not proof that it uses this project.
+    $ready = New-Object 'System.Collections.Generic.List[object]'
+    $blocked = New-Object 'System.Collections.Generic.List[object]'
+    $preflightBytes = [long]0
+    $uncertainCount = 0
+    Inform (Say '正在预检所选项目（进程关联、安全路径和项目类型）...' 'Preflighting selected projects (process association, safe paths and project type)...') 'Cyan'
     foreach ($index in $indices) {
-        $candidate=$projects[$index-1]
-        Inform (Say ("[{0}] 项目：{1}`n待隔离：{2}`n大小：{3}`n项目文件变动：{4}；构建样本变动：{5}`n请关闭 IDE 和构建任务。" -f $index,$candidate.Project,$candidate.Path,(BytesHuman $candidate.Bytes),(Format-Activity $candidate.ProjectActivity),(Format-Activity $candidate.BuildActivity)) ("[{0}] Project: {1}`nQuarantine: {2}`nSize: {3}`nProject changes: {4}; build sample: {5}`nClose IDEs/builds." -f $index,$candidate.Project,$candidate.Path,(BytesHuman $candidate.Bytes),(Format-Activity $candidate.ProjectActivity),(Format-Activity $candidate.BuildActivity))) 'Yellow'
-        # Perform process check before asking, and recheck just before moving.
-        try { Assert-NoActiveBuild $candidate.Project }
-        catch { Write-Warning $_.Exception.Message; $skipped++; continue }
-        if (-not (AskExact (Say ("第 {0} 项：输入 QUARANTINE 确认隔离，其他输入跳过" -f $index) ("Item {0}: type QUARANTINE to move; anything else skips" -f $index)) 'QUARANTINE')) { $skipped++; continue }
+        $candidate = $projects[$index - 1]
         try {
-            $destination = Move-DevToQuarantine $candidate
+            [void](AssertSafePath $candidate.Path 'build quarantine preflight')
+            $kind = Get-ProjectKind $candidate.Project
+            if ($kind -ne $candidate.Kind -or -not (Test-DevCandidate $candidate.Path $candidate.Project $kind)) { throw 'Project classification changed' }
+            $risk = Get-ProjectProcessRisk $candidate.Project $candidate.Path
+            if ($risk.Related.Count -gt 0) {
+                $details = @($risk.Related | Select-Object -First 4 | ForEach-Object { '{0}(PID {1})' -f $_.Name,$_.ProcessId }) -join ', '
+                throw (Say "存在明确关联进程：$details" "Directly related processes: $details")
+            }
+            $uncertain = ($risk.Uncertain.Count -gt 0)
+            if ($uncertain) { $uncertainCount++ }
+            $preflightBytes += [long]$candidate.Bytes
+            $ready.Add([pscustomobject]@{Index=$index;Candidate=$candidate;Uncertain=$uncertain})
+        } catch {
+            $blocked.Add([pscustomobject]@{Index=$index;Path=$candidate.Path;Reason=$_.Exception.Message})
+        }
+    }
+    Inform (Say ("预检结果：选择 {0} 项；可进入确认 {1} 项（约 {2}）；其中进程归属不确定 {3} 项；已阻止 {4} 项。" -f $indices.Count,$ready.Count,(BytesHuman $preflightBytes),$uncertainCount,$blocked.Count) ("Preflight: {0} selected; {1} eligible for confirmation ({2}); {3} with uncertain processes; {4} blocked." -f $indices.Count,$ready.Count,(BytesHuman $preflightBytes),$uncertainCount,$blocked.Count)) 'Cyan'
+    foreach ($item in $blocked) {
+        Inform (Say ("[跳过 {0}] {1}`n  原因：{2}" -f $item.Index,$item.Path,$item.Reason) ("[Blocked {0}] {1}`n  Reason: {2}" -f $item.Index,$item.Path,$item.Reason)) 'Red'
+    }
+    if ($ready.Count -eq 0) { Inform (Say '没有符合本次操作条件的项目，未修改任何文件。' 'Nothing eligible; no changes made.') 'Yellow'; return }
+    Inform (Say '以下只是隔离（移动到同盘隔离区），不立即腾出空间。以后可用菜单 8 恢复，菜单 9 到期后永久清理。' 'Quarantine moves builds on the SAME volume; no space is reclaimed now. Menu 8 restores and menu 9 purges after the hold period.') 'Yellow'
+    Inform (Say '  [1] 取消本次操作（推荐默认，完全不修改）' '  [1] Cancel (recommended default; no changes)') 'Green'
+    Inform (Say '  [2] 批量隔离预检合格项：一次确认，不再逐个询问；执行时仍逐项重新检查安全条件' '  [2] Batch quarantine eligible items: confirm once; safety rechecked for EACH item at execution') 'Yellow'
+    Inform (Say '  [3] 逐项确认：每个项目决定继续或跳过' '  [3] Confirm individually: decide for each item') 'Gray'
+    $mode = (Read-Host (Say '请选择 [1/2/3，回车默认 1]' 'Select [1/2/3, Enter defaults to 1]')).Trim()
+    if ($mode -notin @('2','3')) { Inform (Say '操作已取消，没有移动文件。' 'Cancelled; nothing moved.') 'Gray'; return }
+    if ($mode -eq '2') {
+        Inform (Say ("批量隔离对象：{0} 个目录，约 {1}。注意：隔离会使项目的构建结果暂时不可用，下次可能需要重新编译。" -f $ready.Count,(BytesHuman $preflightBytes)) ("Batch targets: {0} directories, approx. {1}. Builds will be unavailable until rebuilt or restored." -f $ready.Count,(BytesHuman $preflightBytes))) 'Yellow'
+        if ($uncertainCount -gt 0) {
+            Inform (Say ("其中 {0} 项存在归属不确定的开发工具进程，当前检测无法证明它们没在使用这些目录。请先关闭相关 IDE / 构建任务。" -f $uncertainCount) ("{0} items have processes of unknown affiliation. Their files may be in use. Close relevant IDE/build tasks first." -f $uncertainCount)) 'Yellow'
+            if (-not (AskExact (Say '若已确认这些项目没有运行并接受剩余风险，请输入 ACCEPT-RISK（回车取消）' 'If projects are idle and you accept residual risk, type ACCEPT-RISK (Enter cancels)') 'ACCEPT-RISK')) {
+                Inform (Say '已取消批量隔离，未修改任何文件。' 'Batch cancelled; nothing changed.') 'Gray'; return
+            }
+        }
+        if (-not (AskExact (Say '最终确认：输入 BATCH-QUARANTINE 批量隔离本次预检合格项（回车取消）' 'Final confirmation: type BATCH-QUARANTINE to move all eligible items (Enter cancels)') 'BATCH-QUARANTINE')) {
+            Inform (Say '已取消批量隔离，未修改任何文件。' 'Batch cancelled; nothing changed.') 'Gray'; return
+        }
+    }
+
+    $moved = 0; $skipped = $blocked.Count
+    $batchFailed = New-Object 'System.Collections.Generic.List[string]'
+    foreach ($entry in $ready) {
+        $index = $entry.Index
+        $candidate = $entry.Candidate
+        $allowUncertain = $false
+        if ($mode -eq '3') {
+            Inform (Say ("[{0}] 项目：{1}`n待隔离：{2}`n大小：{3}`n项目文件变动：{4}；构建样本变动：{5}" -f $index,$candidate.Project,$candidate.Path,(BytesHuman $candidate.Bytes),(Format-Activity $candidate.ProjectActivity),(Format-Activity $candidate.BuildActivity)) ("[{0}] Project: {1}`nQuarantine: {2}`nSize: {3}`nProject changes: {4}; build sample: {5}" -f $index,$candidate.Project,$candidate.Path,(BytesHuman $candidate.Bytes),(Format-Activity $candidate.ProjectActivity),(Format-Activity $candidate.BuildActivity))) 'Yellow'
+            if ($entry.Uncertain) {
+                Inform (Say '存在进程归属不确定的情况；若不能确定项目已停止运行，请跳过。' 'Uncertain process affiliation; skip if the project may still be running.') 'Yellow'
+                $continueRisk = (Read-Host (Say '输入 2 接受不确定风险并继续；回车默认跳过' 'Type 2 to accept residual risk; Enter skips')).Trim()
+                if ($continueRisk -ne '2') { $skipped++; continue }
+                $allowUncertain = $true
+            }
+            if (-not (AskExact (Say ("第 {0} 项：输入 QUARANTINE 确认隔离；回车跳过" -f $index) ("Item {0}: type QUARANTINE to move; Enter skips" -f $index)) 'QUARANTINE')) { $skipped++; continue }
+        } else {
+            $allowUncertain = $entry.Uncertain
+            Inform (Say ("批量执行 [{0}] {1}" -f $index,$candidate.Path) ("Batch processing [{0}] {1}" -f $index,$candidate.Path)) 'Cyan'
+        }
+        try {
+            # Recheck safety and process affiliation immediately before EACH move.
+            # Even in batch mode, newly related processes, path changes, links,
+            # or changed build contents abort that individual item.
+            if ($mode -eq '2') {
+                $liveRisk = Get-ProjectProcessRisk $candidate.Project $candidate.Path
+                if ($liveRisk.Related.Count -gt 0) { throw 'New directly related process detected' }
+                if ($liveRisk.Uncertain.Count -gt 0 -and -not $entry.Uncertain) { throw 'New uncertain build process detected since preflight' }
+            }
+            $destination = Move-DevToQuarantine $candidate $allowUncertain
             Inform (Say "已隔离：$destination；磁盘空间未释放。" "Quarantined: $destination; no disk space reclaimed.") 'Green'
             $moved++
-        } catch { Write-Warning "Quarantine aborted: $($_.Exception.Message)"; $skipped++ }
+        } catch {
+            $reason = $_.Exception.Message
+            Inform (Say ("[跳过 {0}] {1}" -f $index,$reason) ("[Skipped {0}] {1}" -f $index,$reason)) 'Yellow'
+            $batchFailed.Add(("[{0}] {1}: {2}" -f $index,$candidate.Path,$reason))
+            $skipped++
+        }
+    }
+    if ($batchFailed.Count -gt 0) {
+        Inform (Say ("本轮执行失败/跳过的操作共 {0} 项，详情见以上提示与会话日志。" -f $batchFailed.Count) ("{0} items failed/skipped at execution. Check output and session log." -f $batchFailed.Count)) 'Yellow'
     }
     Inform (Say ("操作结束：成功隔离 {0} 项，跳过/拒绝 {1} 项。通过菜单 8 恢复，菜单 9 在保留期后清理。" -f $moved,$skipped) ("Finished: {0} quarantined, {1} skipped/blocked. Restore via 8, purge after hold via 9." -f $moved,$skipped)) 'Cyan' 
 }
